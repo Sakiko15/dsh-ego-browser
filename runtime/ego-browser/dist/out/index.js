@@ -2542,7 +2542,11 @@ async function waitForNetworkMatch(kind, matcher, options) {
     const networkEvents = acquireNetworkEvents();
     let matched;
     try {
-        void networkEvents.ready;
+        // [fork] Await the domain enable before subscribing the waiter. Upstream
+        // used `void networkEvents.ready`, so the waiter could be registered
+        // while Network.enable was still in flight and the first events of a
+        // navigation were dropped.
+        await networkEvents.ready;
         await waitForBrowserEvent((event) => {
             matched = processNetworkEvent(kind, matcher, event, requests, timeout);
             return Boolean(matched);
@@ -2598,7 +2602,19 @@ function processNetworkEvent(kind, matcher, event, requests, timeout) {
 }
 function networkMatches(facade, matcher, kind) {
     if (typeof matcher === "string") {
-        return facade.url() === matcher;
+        // [fork] Playwright glob semantics. Upstream compared the URL with `===`,
+        // so the documented glob callers ('**/search**') could never match and
+        // every waitForRequest/waitForResponse timed out. Reuse the module's
+        // existing globToRegExp (the one urlMatches uses) so waitForURL and the
+        // network waits accept the same patterns.
+        const url = facade.url();
+        if (url === matcher) {
+            return true;
+        }
+        if (!/[*?]/.test(matcher)) {
+            return false;
+        }
+        return globToRegExp(matcher).test(url);
     }
     if (matcher instanceof RegExp) {
         matcher.lastIndex = 0;
@@ -5103,7 +5119,7 @@ async function useOrCreateTaskSpace(nameOrId) {
     const existing = findMatchingTaskSpace(spaces, nameOrId);
     if (!existing) {
         if (typeof nameOrId === "number") {
-            throw new Error(`task space not found: ${nameOrId}`);
+            throw new Error(`task space not found: ${nameOrId}${describeAvailableSpaces(spaces)}`);
         }
         return newTaskSpace(nameOrId);
     }
@@ -5182,7 +5198,8 @@ async function completeTaskSpace(nameOrId, options) {
     const spaces = await listTaskSpaces();
     const match = findMatchingTaskSpace(spaces, nameOrId);
     if (!match) {
-        throw new Error(`task space not found: ${nameOrId}`);
+        // [fork] Name the spaces that do exist so the caller can retry.
+        throw new Error(`task space not found: ${nameOrId}${describeAvailableSpaces(spaces)}`);
     }
     if (options.keep) {
         if (match.ownership === "user") {
@@ -5323,7 +5340,7 @@ async function findTaskSpace(nameOrId) {
     const spaces = await listTaskSpaces();
     const match = findMatchingTaskSpace(spaces, nameOrId);
     if (!match)
-        throw new Error(`task space not found: ${nameOrId}`);
+        throw new Error(`task space not found: ${nameOrId}${describeAvailableSpaces(spaces)}`);
     return match;
 }
 function findMatchingTaskSpace(spaces, nameOrId) {
@@ -5340,6 +5357,21 @@ function findMatchingTaskSpace(spaces, nameOrId) {
         }
     }
     return undefined;
+}
+/**
+ * [fork] Render the known task spaces for a "not found" error.
+ *
+ * The bare message left callers guessing which name to pass — the plugin's own
+ * default space is "dsh-agent", not "default".
+ * @param {Array<{id?:number,name?:string}>} spaces Known task spaces.
+ * @returns {string} " (available: a, b)" or " (available: none)".
+ */
+function describeAvailableSpaces(spaces) {
+    const names = (Array.isArray(spaces) ? spaces : [])
+        .map((space) => (space && space.name) ||
+        (space && space.id !== undefined ? String(space.id) : null))
+        .filter(Boolean);
+    return ` (available: ${names.length > 0 ? names.join(", ") : "none"})`;
 }
 async function siteSkillsForUrl(url) {
     return siteSkillsForUrl$1(url, {

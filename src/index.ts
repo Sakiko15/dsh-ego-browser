@@ -928,16 +928,36 @@ async function runEgoScript(subprocess: SubprocessService, script: string, exec:
 const useSpace = (name: string | number): string =>
   `const task = await taskSpaces.useOrCreate(${j(name)})\n`
 /**
+ * [fork] Tab the caller explicitly selected through ego_tabs (switch / open).
+ *
+ * `active` cannot carry this intent: the browser reassigns it on its own, so a
+ * tab opened moments ago can report `active: false` while an older tab reports
+ * `active: true`. Remembering the explicit choice in-process is the only
+ * reliable signal across CLI invocations.
+ *
+ * Cleared when that tab is closed, or when the id stops existing (a browser
+ * restart wipes every target id).
+ */
+let pinnedTabId: string | null = null
+/**
  * JS snippet that makes the harness act on a real page tab.
  *
  * The Linux host (PR #234 ego-linux) does not reliably persist "current tab"
  * across CLI invocations: a fresh process sometimes resolves page actions
- * against a blank/stale tab. Selecting the first non-blank tab in the space
- * before acting makes cross-process tool calls deterministic.
+ * against a blank/stale tab. Selecting a non-blank tab in the space before
+ * acting makes cross-process tool calls deterministic.
+ *
+ * [fork] Prefer the tab the caller explicitly pinned (ego_tabs switch/open) so
+ * that selection survives into the following tool call. Without this the
+ * snippet always re-selected the first non-about: tab and silently undid an
+ * explicit switch.
  */
 const ensureRealTab = (): string =>
   `const __tabs = await browser.listTabs()\n` +
-  `const __real = __tabs.find(t => !t.url.startsWith('about:') && !t.url.startsWith('chrome://')) ?? __tabs[0]\n` +
+  `const __pinned = ${j(pinnedTabId)}\n` +
+  `const __real = (__pinned ? __tabs.find(t => t.targetId === __pinned) : null)\n` +
+  `  ?? __tabs.find(t => !t.url.startsWith('about:') && !t.url.startsWith('chrome://'))\n` +
+  `  ?? __tabs[0]\n` +
   `if (__real) await browser.switchTab(__real.targetId)\n`
 function renderText(_args: unknown, value: unknown): unknown[] {
   const v = value as Record<string, unknown> | null
@@ -2003,13 +2023,24 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
           `console.log('${SENTINEL}' + JSON.stringify({ ok: true${extra}, tabs: __tabs }))\n`
         if (action === 'switch') {
           if (!targetId) return `${space}console.log('${SENTINEL}' + JSON.stringify({ ok: false, error: 'targetId is required for action=switch' }))\n`
+          // [fork] Pin the explicit choice so the NEXT tool call keeps acting on
+          // this tab instead of falling back to the first non-about: tab.
+          pinnedTabId = targetId
           return `${space}await browser.switchTab(${j(targetId)})\n${done(`, switched: ${j(targetId)}`)}`
         }
         if (action === 'open') {
-          return `${space}const __created = await ego.createTab(${j(url || 'about:blank')})\n${done(`, created: __created && __created.targetId || null`)}`
+          // [fork] A tab the caller just opened is the intended target too.
+          return (
+            `${space}const __created = await ego.createTab(${j(url || 'about:blank')})\n` +
+            `const __newId = (__created && __created.targetId) || null\n` +
+            `if (__newId) await browser.switchTab(__newId)\n` +
+            done(`, created: __newId`)
+          )
         }
         if (action === 'close') {
           if (!targetId) return `${space}console.log('${SENTINEL}' + JSON.stringify({ ok: false, error: 'targetId is required for action=close' }))\n`
+          // [fork] Drop the pin when the pinned tab itself is the one closing.
+          if (pinnedTabId !== null && pinnedTabId === targetId) pinnedTabId = null
           return `${space}await browser.closeTab(${j(targetId)})\n${done(`, closed: ${j(targetId)}`)}`
         }
         if (action !== 'list') return `${space}console.log('${SENTINEL}' + JSON.stringify({ ok: false, error: ${j(`unknown action: ${action}`)} }))\n`
@@ -2379,11 +2410,17 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
               args.deltaY,
               300,
             )})\n`
+        // [fork] page.mouse.wheel dispatches asynchronously, so reading
+        // page.info() immediately returned the PRE-scroll offsets (observed:
+        // scrollY reported 0 while window.scrollY was already 400). Settle
+        // first, then read the live values from the page itself.
         return (
           `${useSpace(str(args.space, cfg.defaultSpace))}${ensureRealTab()}` +
           action +
-          `const __p = await page.info()\n` +
-          `console.log('${SENTINEL}' + JSON.stringify({ ok: true, scrollX: __p.sx ?? null, scrollY: __p.sy ?? null }))\n`
+          `await page.waitForTimeout(150)\n` +
+          `const __sx = await page.evaluate(() => window.scrollX).catch(() => null)\n` +
+          `const __sy = await page.evaluate(() => window.scrollY).catch(() => null)\n` +
+          `console.log('${SENTINEL}' + JSON.stringify({ ok: true, scrollX: __sx, scrollY: __sy }))\n`
         )
       },
     }),

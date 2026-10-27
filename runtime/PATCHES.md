@@ -37,3 +37,13 @@
   若改探针特征，两处都要同步。
 - **同步提醒**：`lib/config.js` 的 `tokenizeArgs`/`filterArgs`/`CHROME_BLOCKED` 与 `runtime/ego-linux/src/chrome.mjs` 的 `tokenizeArgs`/`filterChromeArgs`/`CHROME_BLOCKED` 是镜像副本（runtime 不 import lib/）——改一处必须同步另一处。
 - 若要跟进 ego-lite 上游，重点 diff 上表的 cursor.mjs；其余文件可直接与上游对齐。
+
+## Fork 分支追加（非上游改动）
+
+以下两项由本 fork 引入，来源是对 vendored 运行时的直接修改（本仓库不含 ego-lite 源码）。
+上游同步时按 `FORK-NOTES.md` 的手工重做步骤处理。
+
+| 文件 | 改动 | 原因 |
+|---|---|---|
+| `runtime/ego-browser/dist/out/index.js` `networkMatches()` + `waitForNetworkMatch()` | 字符串 pattern 分支由 `facade.url() === matcher` 改为「全等优先，含 `*`/`?` 时走模块既有的 `globToRegExp`」；`void networkEvents.ready` 改为 `await` | `ego_wait_for_response` / `ego_wait_for_request` 的文档与工具描述都声明接受 glob（如 `**/search**`），但实现是全等比较，导致**永不匹配、必然超时**；不 await 还会丢掉一次导航开头的 Network 事件。复用 `urlMatches` 已有的 `globToRegExp`，不新增第二份实现 |
+| `runtime/ego-browser/dist/out/index.js` 三处 `task space not found` | 新增 `describeAvailableSpaces(spaces)`，报错追加 `(available: a, b)` | 插件默认 space 是 `dsh-agent` 而非 `default`，裸报错让调用方无从得知可用名称，只能靠猜 |
